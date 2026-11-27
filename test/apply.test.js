@@ -8,7 +8,7 @@ const capture = require('../lib/capture.js');
 const { fakeGithub, fakeCore, pullRequest, assigneesOf, repo } = require('./fake_github.js');
 
 const pool = ['alice', 'bob', 'carol'];
-const review = (login, state) => ({ user: { login }, state });
+const review = (login, state, id) => ({ id, user: { login }, state });
 const context = { repo, payload: { workflow_run: { head_sha: 'head-sha' } } };
 
 function writeArtifact(t, contents) {
@@ -20,8 +20,8 @@ function writeArtifact(t, contents) {
 }
 
 test('apply', async (t) => {
-  const artifact = (submitter, review_state, pr_number = 1) =>
-    JSON.stringify({ pr_number, review_state, submitter });
+  const artifact = (submitter, review_state, pr_number = 1, review_id = undefined) =>
+    JSON.stringify({ pr_number, review_id, review_state, submitter });
   const tests = [
     {
       name: 'approval moves the ball to the reviewer',
@@ -66,6 +66,33 @@ test('apply', async (t) => {
       pr: { assignees: ['bob'] },
       reviews: [review('bob', 'COMMENTED'), review('bob', 'APPROVED')],
       artifact: artifact('bob', 'commented'),
+      want: ['bob'],
+    },
+    {
+      name: 'an older review does not repeat its move after a newer one in the same state',
+      pr: { assignees: ['bob'] },
+      reviews: [review('bob', 'COMMENTED', 10), review('contributor', 'COMMENTED', 11), review('bob', 'COMMENTED', 12)],
+      artifact: artifact('bob', 'commented', 1, 10),
+      want: ['bob'],
+    },
+    {
+      name: 'the latest of two reviews in the same state is applied',
+      pr: { assignees: ['bob'] },
+      reviews: [review('bob', 'COMMENTED', 10), review('bob', 'COMMENTED', 12)],
+      artifact: artifact('bob', 'commented', 1, 12),
+      want: ['contributor'],
+    },
+    {
+      name: 'an artifact without a review id is matched by state alone',
+      pr: { assignees: ['bob'] },
+      reviews: [review('bob', 'COMMENTED', 10), review('bob', 'COMMENTED', 12)],
+      artifact: artifact('bob', 'commented'),
+      want: ['contributor'],
+    },
+    {
+      name: 'a review id that is not an integer is ignored',
+      pr: { assignees: ['bob'] }, reviews: [review('bob', 'COMMENTED', 10)],
+      artifact: artifact('bob', 'commented', 1, '10'),
       want: ['bob'],
     },
     {
@@ -185,7 +212,7 @@ test('capture output is what apply reads', async (t) => {
     context: {
       payload: {
         pull_request: { number: 1 },
-        review: { state: 'APPROVED', user: { login: 'bob' } },
+        review: { id: 7, state: 'APPROVED', user: { login: 'bob' } },
       },
     },
     core: fakeCore(),
@@ -193,7 +220,15 @@ test('capture output is what apply reads', async (t) => {
   });
 
   const pr = pullRequest({ assignees: ['contributor'] });
-  const github = fakeGithub({ pool, prs: [pr], reviews: { 1: [review('bob', 'APPROVED')] } });
+  const reviews = [review('bob', 'APPROVED', 7)];
+  const github = fakeGithub({ pool, prs: [pr], reviews: { 1: reviews } });
   await apply({ github, context, core: fakeCore(), reviewFile: path.join(dir, 'review.json') });
   assert.deepEqual(assigneesOf(pr), ['bob']);
+
+  // The id reaches apply, which is what tells this review from a later
+  // approval by the same reviewer.
+  const later = pullRequest({ assignees: ['contributor'] });
+  const withLater = fakeGithub({ pool, prs: [later], reviews: { 1: [...reviews, review('bob', 'APPROVED', 8)] } });
+  await apply({ github: withLater, context, core: fakeCore(), reviewFile: path.join(dir, 'review.json') });
+  assert.deepEqual(assigneesOf(later), ['contributor']);
 });
